@@ -16,9 +16,11 @@ A collection of MetaTrader 5 Expert Advisors (EAs) focusing on scalping, trend-f
 ### 2. BollingerBandsEA.mq5
 - **Strategy:** Classic Bollinger Band mean reversion/breakout strategy.
 - **Key Features:**
-  - Standard entry on band touches/closes.
-  - Dynamic Trailing Stop.
-  - Session filters.
+  - **Propfirm Mode ($ Risk):** Entry with a fixed Dollar-based Emergency SL.
+  - **Fixed Lot Trading:** Uses a fixed lot size while calculating SL distance based on requested risk amount ($).
+  - **Delayed Trailing:** Emergency SL stays fixed until the price touches the Middle Band (Basis).
+  - **Dynamic Trailing:** Switches to Bollinger Band trailing after the middle band touch.
+  - Session filters (Asia, London, NY).
 
 ### 3. Advanced_EMA_CCI_EA.mq5
 - **Strategy:** Trend-following using Exponential Moving Averages (EMA) and Commodity Channel Index (CCI).

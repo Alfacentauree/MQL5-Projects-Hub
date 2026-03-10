@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Gemini CLI"
 #property link      "https://www.mql5.com"
-#property version   "2.20"
+#property version   "2.40"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -16,7 +16,9 @@ input double   InpMult       = 2.0;        // BB Multiplier
 input int      InpDirection  = 0;          // Strategy Direction (-1: Short, 0: Both, 1: Long)
 
 input string   sep2          = "--- Money Management ---";
-input double   InpLotSize    = 0.1;        // Trading Lot Size
+input bool     InpUsePropMode= true;       // Use Propfirm Mode (Fixed $ Risk)
+input double   InpRiskDollar = 100.0;      // Risk Amount in Dollars ($)
+input double   InpLotSize    = 0.1;        // Fixed Lot Size
 input int      InpWaitMin    = 15;         // Wait minutes after trade close
 input long     InpMagicNum   = 123456;     // EA Magic Number
 
@@ -62,10 +64,10 @@ void OnTick()
 {
    // 1. Monitor Position Changes for Cooldown
    bool isPositionOpen = PositionSelectByMagic(_Symbol, InpMagicNum);
-   if(wasPositionOpen && !isPositionOpen) // Position just closed
+   if(wasPositionOpen && !isPositionOpen) 
    {
       lastExitTime = TimeCurrent();
-      Print("Position Closed. 15-minute cooldown started.");
+      Print("Position Closed. Cooldown started.");
    }
    wasPositionOpen = isPositionOpen;
 
@@ -73,7 +75,7 @@ void OnTick()
    if(!isPositionOpen && lastExitTime > 0)
    {
       long secondsPassed = TimeCurrent() - lastExitTime;
-      if(secondsPassed < InpWaitMin * 60) return; // Still in cooldown
+      if(secondsPassed < InpWaitMin * 60) return;
    }
 
    // 3. Copy indicator data
@@ -95,17 +97,9 @@ void OnTick()
       int hour = dt.hour;
       
       bool isWithinSession = false;
-      
-      // Asia Session: 00:00 - 09:00
       if(InpUseAsia && (hour >= 0 && hour < 9)) isWithinSession = true;
-      
-      // London Session: 09:00 - 18:00
       if(InpUseLondon && (hour >= 9 && hour < 18)) isWithinSession = true;
-      
-      // New York Session: 15:00 - 24:00
       if(InpUseNY && (hour >= 15 && hour < 24)) isWithinSession = true;
-      
-      // If no sessions are selected, we assume trading is always allowed (unless you want it OFF by default)
       if(!InpUseAsia && !InpUseLondon && !InpUseNY) isWithinSession = true;
 
       if(isWithinSession)
@@ -113,20 +107,25 @@ void OnTick()
          // Long Signal
          if((close1 < lowerBand[1] && close0 >= lowerBand[0]) && (InpDirection == 0 || InpDirection == 1))
          {
-            trade.Buy(InpLotSize, _Symbol, ask, 0, 0, "BBandLE");
+            double sl = 0;
+            if(InpUsePropMode) sl = CalculateSLByDollar(ask, POSITION_TYPE_BUY);
+            
+            trade.Buy(InpLotSize, _Symbol, ask, sl, 0, "BB_Prop_Buy");
          }
          // Short Signal
          else if((close1 > upperBand[1] && close0 <= upperBand[0]) && (InpDirection == 0 || InpDirection == -1))
          {
-            trade.Sell(InpLotSize, _Symbol, bid, 0, 0, "BBandSE");
+            double sl = 0;
+            if(InpUsePropMode) sl = CalculateSLByDollar(bid, POSITION_TYPE_SELL);
+
+            trade.Sell(InpLotSize, _Symbol, bid, sl, 0, "BB_Prop_Sell");
          }
       }
    }
 
-   // 5. Fully Dynamic Trailing Stop (Follows Band exactly)
+   // 5. Dynamic Trailing Stop (Propfirm Logic)
    if(isPositionOpen)
    {
-      // Find the specific ticket for THIS EA instance
       ulong ticket = 0;
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -145,39 +144,60 @@ void OnTick()
       {
          double currentSL = PositionGetDouble(POSITION_SL);
          double currentTP = PositionGetDouble(POSITION_TP);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          
          if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
          {
-            // Activate ONLY after price touches/crosses Middle Band (Basis)
-            if(bid >= basisBand[0] || currentSL > 0) 
+            double emergencySL = CalculateSLByDollar(openPrice, POSITION_TYPE_BUY);
+
+            // Activate Trailing ONLY after price touches/crosses Middle Band (Basis)
+            // Or if the SL has already moved away from the Emergency Dollar SL
+            if(bid >= basisBand[0] || (MathAbs(currentSL - emergencySL) > _Point && currentSL > 0) || !InpUsePropMode) 
             {
                double newSL = NormalizeDouble(lowerBand[0], digits);
-               
-               // Move SL if it changed by more than 1 point (Up or Down)
                if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
-               {
-                  if(!trade.PositionModify(ticket, newSL, currentTP))
-                     Print("Dynamic SL Update Failed: ", trade.ResultRetcodeDescription());
-               }
+                  trade.PositionModify(ticket, newSL, currentTP);
             }
          }
          else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          {
-            // Activate ONLY after price touches/crosses Middle Band (Basis)
-            if(ask <= basisBand[0] || currentSL > 0)
+            double emergencySL = CalculateSLByDollar(openPrice, POSITION_TYPE_SELL);
+
+            if(ask <= basisBand[0] || (MathAbs(currentSL - emergencySL) > _Point && currentSL > 0) || !InpUsePropMode)
             {
                double newSL = NormalizeDouble(upperBand[0], digits);
-               
-               // Move SL if it changed by more than 1 point (Up or Down)
                if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
-               {
-                  if(!trade.PositionModify(ticket, newSL, currentTP))
-                     Print("Dynamic SL Update Failed: ", trade.ResultRetcodeDescription());
-               }
+                  trade.PositionModify(ticket, newSL, currentTP);
             }
          }
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate SL Price based on Fixed Dollar Risk                    |
+//+------------------------------------------------------------------+
+double CalculateSLByDollar(double entryPrice, ENUM_POSITION_TYPE type)
+{
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   if(tickValue <= 0 || InpLotSize <= 0) return 0;
+
+   // Calculate points needed for the dollar risk
+   // Formula: DollarRisk = Points * TickValue * (LotSize / TickSize?? No, LotSize directly if tickValue is per 1.0 lot)
+   // In MQL5: TickValue is usually the profit for 1.0 lot per 1 tick (tickSize)
+   
+   double points = InpRiskDollar / (InpLotSize * (tickValue / tickSize));
+   
+   double slPrice = 0;
+   if(type == POSITION_TYPE_BUY)
+      slPrice = NormalizeDouble(entryPrice - points, digits);
+   else
+      slPrice = NormalizeDouble(entryPrice + points, digits);
+
+   return slPrice;
 }
 
 //+------------------------------------------------------------------+
