@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                     SupertrendHeikenAshiEA.mq5   |
-//|                                  Copyright 2026, Gemini CLI      |
+//|                                  Copyright 2026, ADD             |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Gemini CLI"

@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                           BollingerBandsEA.mq5   |
-//|                                  Copyright 2026, Gemini CLI      |
+//|                                  Copyright 2026 ADD              |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Gemini CLI"
 #property link      "https://www.mql5.com"
-#property version   "2.40"
+#property version   "2.41"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -20,6 +20,7 @@ input bool     InpUsePropMode= true;       // Use Propfirm Mode (Fixed $ Risk)
 input double   InpRiskDollar = 100.0;      // Risk Amount in Dollars ($)
 input double   InpLotSize    = 0.1;        // Fixed Lot Size
 input int      InpWaitMin    = 15;         // Wait minutes after trade close
+input int      InpBufferPoints = 30;       // Safety Buffer from BB (Points)
 input long     InpMagicNum   = 123456;     // EA Magic Number
 
 input string   sep3          = "--- Session Filter ---";
@@ -33,6 +34,8 @@ CTrade         trade;                     // Trade class instance
 double         upperBand[], lowerBand[], basisBand[];
 datetime       lastExitTime = 0;          // Global tracker for cooldown
 bool           wasPositionOpen = false;    // To detect when a position closes
+bool           indicatorAdded = false;     // Visual check for chart display
+bool           isTrailingActive = false;   // Global flag for trailing state
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -41,14 +44,18 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagicNum);
    handleBB = iBands(_Symbol, _Period, InpLength, 0, InpMult, PRICE_CLOSE);
-   if(handleBB == INVALID_HANDLE) { Print("Failed to create BB handle"); return(INIT_FAILED); }
    
-   if(!ChartIndicatorAdd(0, 0, handleBB)) Print("Failed to add BB to chart");
+   if(handleBB == INVALID_HANDLE) 
+   { 
+      Print("CRITICAL: Failed to create BB handle. Error: ", GetLastError()); 
+      return(INIT_FAILED); 
+   }
    
    ArraySetAsSeries(upperBand, true);
    ArraySetAsSeries(lowerBand, true);
    ArraySetAsSeries(basisBand, true);
    
+   isTrailingActive = false;
    return(INIT_SUCCEEDED);
 }
 
@@ -62,12 +69,19 @@ void OnDeinit(const int reason) { IndicatorRelease(handleBB); }
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // 1. Monitor Position Changes for Cooldown
+   // Try to add BB to chart visually once if not already done
+   if(!indicatorAdded && MQLInfoInteger(MQL_VISUAL_MODE) == 0)
+   {
+      if(ChartIndicatorAdd(0, 0, handleBB)) indicatorAdded = true;
+   }
+
+   // 1. Monitor Position Changes for Cooldown & Reset
    bool isPositionOpen = PositionSelectByMagic(_Symbol, InpMagicNum);
    if(wasPositionOpen && !isPositionOpen) 
    {
       lastExitTime = TimeCurrent();
-      Print("Position Closed. Cooldown started.");
+      isTrailingActive = false; // RESET TRAILING FLAG
+      Print("Position Closed. Cooldown started & Trailing Reset.");
    }
    wasPositionOpen = isPositionOpen;
 
@@ -146,28 +160,60 @@ void OnTick()
          double currentTP = PositionGetDouble(POSITION_TP);
          double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          
+         double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+         double freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * _Point;
+         double brokerMin = MathMax(stopLevel, freezeLevel) + (5 * _Point);
+         double userBuffer = InpBufferPoints * _Point;
+         double finalBuffer = MathMax(brokerMin, userBuffer);
+
          if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
          {
-            double emergencySL = CalculateSLByDollar(openPrice, POSITION_TYPE_BUY);
-
-            // Activate Trailing ONLY after price touches/crosses Middle Band (Basis)
-            // Or if the SL has already moved away from the Emergency Dollar SL
-            if(bid >= basisBand[0] || (MathAbs(currentSL - emergencySL) > _Point && currentSL > 0) || !InpUsePropMode) 
+            // TRIGGER: Price touches or goes above Middle Band (Basis)
+            // Once triggered, SL follows the Lower Band even if it moves down
+            if(!isTrailingActive && (bid >= basisBand[0])) 
             {
-               double newSL = NormalizeDouble(lowerBand[0], digits);
-               if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
-                  trade.PositionModify(ticket, newSL, currentTP);
+               isTrailingActive = true;
+               Print("Trailing activated for BUY.");
+            }
+
+            if(isTrailingActive) 
+            {
+               double newSL = NormalizeDouble(lowerBand[0] - finalBuffer, digits);
+               
+               // Validation: Must be below bid - brokerMin
+               if(newSL < (bid - brokerMin))
+               {
+                  // Follow the band up AND down, but only if change is significant (> 1 point)
+                  if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
+                  {
+                     trade.PositionModify(ticket, newSL, currentTP);
+                  }
+               }
             }
          }
          else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          {
-            double emergencySL = CalculateSLByDollar(openPrice, POSITION_TYPE_SELL);
-
-            if(ask <= basisBand[0] || (MathAbs(currentSL - emergencySL) > _Point && currentSL > 0) || !InpUsePropMode)
+            // TRIGGER: Price touches or goes below Middle Band (Basis)
+            // Once triggered, SL follows the Upper Band even if it moves up
+            if(!isTrailingActive && (ask <= basisBand[0])) 
             {
-               double newSL = NormalizeDouble(upperBand[0], digits);
-               if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
-                  trade.PositionModify(ticket, newSL, currentTP);
+               isTrailingActive = true;
+               Print("Trailing activated for SELL.");
+            }
+
+            if(isTrailingActive)
+            {
+               double newSL = NormalizeDouble(upperBand[0] + finalBuffer, digits);
+               
+               // Validation: Must be above ask + brokerMin
+               if(newSL > (ask + brokerMin))
+               {
+                  // Follow the band down AND up, but only if change is significant (> 1 point)
+                  if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
+                  {
+                     trade.PositionModify(ticket, newSL, currentTP);
+                  }
+               }
             }
          }
       }
@@ -186,9 +232,6 @@ double CalculateSLByDollar(double entryPrice, ENUM_POSITION_TYPE type)
    if(tickValue <= 0 || InpLotSize <= 0) return 0;
 
    // Calculate points needed for the dollar risk
-   // Formula: DollarRisk = Points * TickValue * (LotSize / TickSize?? No, LotSize directly if tickValue is per 1.0 lot)
-   // In MQL5: TickValue is usually the profit for 1.0 lot per 1 tick (tickSize)
-   
    double points = InpRiskDollar / (InpLotSize * (tickValue / tickSize));
    
    double slPrice = 0;

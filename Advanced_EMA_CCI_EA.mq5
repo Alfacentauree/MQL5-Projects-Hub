@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                       Advanced_EMA_CCI_EA.mq5    |
-//|                                  Copyright 2026, Gemini CLI      |
+//|                                  Copyright 2026, ADD             |
 //|                                             https://mql5.com     |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Gemini CLI"

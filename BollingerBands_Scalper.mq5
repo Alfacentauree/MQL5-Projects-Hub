@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                     BollingerBands_Scalper.mq5   |
-//|                                  Copyright 2026, Gemini CLI      |
+//|                                  Copyright 2026, ADD             |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Gemini CLI"
@@ -18,10 +18,13 @@ input int      InpMinBreach  = 50;         // Min Breach outside Band (Points/10
 input int      InpDirection  = 0;          // Strategy Direction (-1: Short, 0: Both, 1: Long)
 
 input string   sep2          = "--- Money Management ---";
-input bool     InpUseRisk    = true;       // Use Risk Percentage (%)
+input bool     InpUsePropMode= true;       // Use Propfirm Mode (Fixed $ Risk)
+input double   InpRiskDollar = 50.0;       // Risk Amount in Dollars ($)
+input bool     InpUseRiskPct = false;      // Use Risk Percentage (%) for Lots
 input double   InpRiskPercent= 1.0;        // Risk % per Trade
 input double   InpLotSize    = 0.1;        // Fixed Lot Size (if Risk is off)
 input int      InpWaitMin    = 15;         // Wait minutes after trade close
+input int      InpBufferPoints = 100;      // Safety Buffer from BB (Points - BTC safe: 100+)
 input long     InpMagicNum   = 987654;     // EA Magic Number (Unique)
 
 input string   sep3          = "--- Session Filter (GMT) ---";
@@ -43,6 +46,7 @@ CTrade         trade;                     // Trade class instance
 double         upperBand[], lowerBand[], basisBand[];
 datetime       lastExitTime = 0;          // Global tracker for cooldown
 bool           wasPositionOpen = false;    // To detect when a position closes
+bool           indicatorAdded = false;     // Visual check for chart display
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -70,9 +74,15 @@ void OnDeinit(const int reason) { IndicatorRelease(handleBB); }
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Visual display once
+   if(!indicatorAdded && MQLInfoInteger(MQL_VISUAL_MODE) == 0)
+   {
+      if(ChartIndicatorAdd(0, 0, handleBB)) indicatorAdded = true;
+   }
+
    // 1. Monitor Position Changes for Cooldown
    bool isPositionOpen = PositionSelectByMagic(_Symbol, InpMagicNum);
-   if(wasPositionOpen && !isPositionOpen) // Position just closed
+   if(wasPositionOpen && !isPositionOpen) 
    {
       lastExitTime = TimeCurrent();
       Print("Position Closed. Cooldown started.");
@@ -104,53 +114,49 @@ void OnTick()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
-   // 4. Entry Signals (Long Wick Rejection + GMT Session)
+   // 4. Entry Signals
    if(!isPositionOpen)
    {
       MqlDateTime dtGMT;
-      TimeToStruct(TimeGMT(), dtGMT); // Use GMT Time
+      TimeToStruct(TimeGMT(), dtGMT);
       int hourGMT = dtGMT.hour;
       
       bool isWithinSession = false;
-      
-      // Check GMT Sessions
       if(InpUseAsia && (hourGMT >= InpAsiaStart && hourGMT < InpAsiaEnd)) isWithinSession = true;
       if(InpUseLondon && (hourGMT >= InpLondonStart && hourGMT < InpLondonEnd)) isWithinSession = true;
       if(InpUseNY && (hourGMT >= InpNYStart && hourGMT < InpNYEnd)) isWithinSession = true;
-      
-      // If no sessions are selected, allow 24/7 trading
       if(!InpUseAsia && !InpUseLondon && !InpUseNY) isWithinSession = true;
 
       if(isWithinSession)
       {
          double minBreach = InpMinBreach * _Point;
-
-         // Rejection Conditions (Candle 1 must touch band but close/open inside)
          bool isLowerRejection = (low1 <= (lowerBand[1] - minBreach) && close1 > lowerBand[1] && open1 > lowerBand[1] && lowerWick >= (bodySize * InpWickRatio));
          bool isUpperRejection = (high1 >= (upperBand[1] + minBreach) && close1 < upperBand[1] && open1 < upperBand[1] && upperWick >= (bodySize * InpWickRatio));
 
-         // Long Signal
          if(isLowerRejection && (InpDirection == 0 || InpDirection == 1))
          {
             double sl = low1;
-            double lot = InpLotSize;
-            if(InpUseRisk) lot = CalculateLotSize(ask, sl);
+            if(InpUsePropMode) sl = CalculateSLByDollar(ask, POSITION_TYPE_BUY);
             
-            if(lowerWick > 0) trade.Buy(lot, _Symbol, ask, sl, 0, "BB_Wick_Buy");
+            double lot = InpLotSize;
+            if(InpUseRiskPct) lot = CalculateLotSize(ask, sl);
+            
+            trade.Buy(lot, _Symbol, ask, sl, 0, "BB_Wick_Buy");
          }
-         // Short Signal
          else if(isUpperRejection && (InpDirection == 0 || InpDirection == -1))
          {
             double sl = high1;
+            if(InpUsePropMode) sl = CalculateSLByDollar(bid, POSITION_TYPE_SELL);
+            
             double lot = InpLotSize;
-            if(InpUseRisk) lot = CalculateLotSize(bid, sl);
+            if(InpUseRiskPct) lot = CalculateLotSize(bid, sl);
 
-            if(upperWick > 0) trade.Sell(lot, _Symbol, bid, sl, 0, "BB_Wick_Sell");
+            trade.Sell(lot, _Symbol, bid, sl, 0, "BB_Wick_Sell");
          }
       }
    }
 
-   // 5. Dynamic Trailing Stop (Follows Opposite Band)
+   // 5. Dynamic Trailing Stop (Safety Logic)
    if(isPositionOpen)
    {
       ulong ticket = 0;
@@ -170,30 +176,72 @@ void OnTick()
       if(ticket > 0)
       {
          double currentSL = PositionGetDouble(POSITION_SL);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          
+         double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+         double freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * _Point;
+         double brokerMin = MathMax(stopLevel, freezeLevel) + (10 * _Point);
+         double userBuffer = InpBufferPoints * _Point;
+         double finalBuffer = MathMax(brokerMin, userBuffer);
+
          if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
          {
-            // Activate Trailing after price touches/crosses Middle Band
-            if(bid >= basisBand[0] || currentSL > 0) 
+            double emergencySL = CalculateSLByDollar(openPrice, POSITION_TYPE_BUY);
+            bool isTrailingActive = (currentSL > 0 && currentSL > emergencySL + _Point);
+            bool triggerReached = (bid >= basisBand[0]);
+
+            if(triggerReached || isTrailingActive) 
             {
-               double newSL = NormalizeDouble(lowerBand[0], digits);
-               if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
-                  trade.PositionModify(ticket, newSL, 0);
+               double newSL = NormalizeDouble(lowerBand[0] - finalBuffer, digits);
+               if(newSL < (bid - brokerMin) && (newSL > currentSL || currentSL == 0))
+               {
+                  if(MathAbs(newSL - currentSL) > _Point)
+                     trade.PositionModify(ticket, newSL, 0);
+               }
             }
          }
          else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          {
-            // Activate Trailing after price touches/crosses Middle Band
-            if(ask <= basisBand[0] || currentSL > 0)
+            double emergencySL = CalculateSLByDollar(openPrice, POSITION_TYPE_SELL);
+            bool isTrailingActive = (currentSL > 0 && currentSL < emergencySL - _Point);
+            bool triggerReached = (ask <= basisBand[0]);
+
+            if(triggerReached || isTrailingActive)
             {
-               double newSL = NormalizeDouble(upperBand[0], digits);
-               if(MathAbs(newSL - currentSL) > _Point || currentSL == 0)
-                  trade.PositionModify(ticket, newSL, 0);
+               double newSL = NormalizeDouble(upperBand[0] + finalBuffer, digits);
+               if(newSL > (ask + brokerMin) && (newSL < currentSL || currentSL == 0))
+               {
+                  if(MathAbs(newSL - currentSL) > _Point)
+                     trade.PositionModify(ticket, newSL, 0);
+               }
             }
          }
       }
    }
 }
+
+//+------------------------------------------------------------------+
+//| Calculate SL Price based on Fixed Dollar Risk                    |
+//+------------------------------------------------------------------+
+double CalculateSLByDollar(double entryPrice, ENUM_POSITION_TYPE type)
+{
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   if(tickValue <= 0 || InpLotSize <= 0) return 0;
+
+   double points = InpRiskDollar / (InpLotSize * (tickValue / tickSize));
+   
+   double slPrice = 0;
+   if(type == POSITION_TYPE_BUY)
+      slPrice = NormalizeDouble(entryPrice - points, digits);
+   else
+      slPrice = NormalizeDouble(entryPrice + points, digits);
+
+   return slPrice;
+}
+
 
 //+------------------------------------------------------------------+
 //| Select position by magic number and symbol                       |
